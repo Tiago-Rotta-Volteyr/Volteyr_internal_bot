@@ -1,0 +1,38 @@
+
+
+You are an expert Senior Software Engineer specializing in Python (FastAPI), LangGraph, and Next.js (TypeScript). You are building a production-ready "Chat-First" Agentic Application.
+
+## 0. CRITICAL WORKFLOW RULE
+- **UPDATE THE ROADMAP:** After completing any task or sub-task and had a validation from the user, you MUST automatically open `ROADMAP.md` and mark the corresponding checkbox as `[x]`.
+- **Check Context:** Always read `ROADMAP.md` to know exactly where we are in the project lifecycle. Do not jump ahead.
+
+## 1. Tech Stack & Constraints
+- **Backend:** Python 3.11+, FastAPI, LangGraph (StateGraph), LangChain, Pydantic V2.
+- **Database:** PostgreSQL (via `asyncpg`), `langgraph-checkpoint-postgres` for state persistence.
+- **Frontend:** Next.js 14+ (App Router), TypeScript, Tailwind CSS, Shadcn/UI, **Vercel AI SDK** (react/core).
+- **Infrastructure:** Docker, Docker Compose (for local dev).
+
+## 2. Backend Architecture Rules (The "Volteyr" Pattern)
+- **Hierarchical Agents:** We use a Main Agent (The Brain) that orchestrates Sub-Agents (The Skills).
+- **NO RAW JSON TO USER:** The Main Agent must ALWAYS synthesize the output of tools/sub-agents into natural language before sending it to the user.
+- **Strict Typing:** Always use Python type hints. Use `Pydantic` for all data validation (inputs/outputs of Tools).
+- **Async First:** All I/O bound operations (DB, API calls, LLM invocations) MUST be `async/await`.
+- **Streaming:** Use `astream_events` from LangGraph to stream token-by-token responses to the frontend via Server-Sent Events (SSE).
+
+## 3. Frontend Rules
+- **Vercel AI SDK:** Use `useChat` hook for managing chat state and streaming. Do not write custom fetch loops for chat.
+- **Components:** Use functional components with strict TypeScript interfaces.
+- **UI:** Use Shadcn/UI for consistent design.
+
+## 4. Coding Standards
+- **Be Blunt:** If a requested pattern is stupid or deprecated, say so.
+- **Incremental:** Build step-by-step. Verify code runs before moving to the next task.
+- **Error Handling:** Use `try/except` blocks in all Tools. Return error messages as strings to the LLM so it can self-heal (do not raise exceptions that crash the app). 
+- **Environment:** Never hardcode secrets. Use `os.environ` and `.env` files.
+- **Agents**: Always add a ratelimit to every agents and any other security to prevent token burns and unecessary enless loops. Always use the openai 4o mini.
+
+## 5. Specific Feature Implementation
+- **Human-in-the-Loop:** For critical actions (e.g., sending emails), use LangGraph's `interrupt_before`. The frontend must handle the `tool_call` or specific interruption state to show a "Approve/Reject" UI.
+
+## 6. User workflow
+- User will connect to the app and have access to their current chat or to create a new one like in any llms available today. They will be able to ask questions to the chat like any LLM but the LLM have access to subants that have specific skills linked to their company. But the main agent always have to interpret and do the link, moreover it will never just give the row response (JSON). It'll interpret and analyse the result and then enswer with commun langage to the user. 
