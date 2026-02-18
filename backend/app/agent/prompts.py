@@ -8,10 +8,11 @@ def get_airtable_agent_prompt(
 ) -> str:
     relations_block = (
         f"\n\n**RELATIONS (détectées automatiquement depuis le schéma Airtable) :**\n{relations_section}\n"
-        "*Instructions : Quand l'utilisateur demande « X de l'entité Y » (ex: projets de l'entreprise VeriPro) :*\n"
-        "1. Interroge DIRECTEMENT la table qui contient X (ex: Projet) avec une formule — jamais « list all » puis filtre.\n"
-        "2. Choisis le bon champ : (lien) affiche le champ principal de la table liée ; (lookup) affiche un champ spécifique (ex: Entreprise). Pour filtrer par entreprise, utilise le champ qui « affiche 'Entreprise' ».\n"
-        "3. Si tu obtiens 0 résultats : essaie un autre champ de la liste qui pointe vers la même table et dont la colonne affichée correspond à ta recherche.\n"
+        "*Instructions CRITIQUES pour « X de l'entité Y » (ex: projets de l'entreprise VeriPro) :*\n"
+        "1. Interroge DIRECTEMENT la table qui contient X (ex: Projet) avec une formule FIND — jamais « list all » puis filtre.\n"
+        "2. Choisis le champ dont la colonne « affiche » correspond à ta recherche : pour un NOM D'ENTREPRISE, utilise le champ qui affiche 'Entreprise' (ex: {{Entreprise}}), PAS le champ Client qui affiche les noms de personnes.\n"
+        "3. Formule à utiliser : `formula=\"FIND('VeriPro', {{Entreprise}})\"` (remplace par le bon champ et la bonne valeur). Pas de LOWER/égalité pour les champs lien/lookup.\n"
+        "4. Si 0 résultats : essaie un autre champ qui affiche la bonne colonne (voir la liste ci-dessus).\n"
         if relations_section.strip()
         else ""
     )
@@ -37,7 +38,7 @@ Pour chaque demande, suis ces étapes logiques :
 Identifie la table pertinente. Si la demande est « X de l'entité Y » (ex: projets de VeriPro), la table cible est celle qui contient X (Projet), pas celle de Y (Client).
 
 **ÉTAPE B : Choisir la Méthode (Formula vs Query)**
-1. **Filtrage par entité liée** (ex: projets d'une entreprise) : Utilise `formula` sur la table cible avec le champ lien : `{{ChampLien}} = 'valeur'`. Ex: table Projet, champ Client → `formula=\"LOWER({{Client}}) = LOWER('VeriPro')\"`.
+1. **Filtrage par entité liée** (ex: projets d'une entreprise) : Utilise FIND avec le bon champ. Pour entreprise VeriPro sur table Projet → `formula=\"FIND('VeriPro', {{Entreprise}})\"` (Entreprise = lookup qui affiche le nom d'entreprise, pas Client qui affiche les noms de personnes).
 2. **Recherche Précise (Email, Statut, ID, Nom Exact)** : `formula` avec égalité.
 3. **Recherche Large (Texte partiel)** : `formula` avec SEARCH.
 4. **Tout lister** : Laisse `formula` et `query` vides.

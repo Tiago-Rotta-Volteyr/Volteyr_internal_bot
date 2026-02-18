@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from app.core.config import AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAMES
 from app.tools.utils import (
+    get_link_and_lookup_field_names,
     get_link_fields_config,
     get_primary_field_name,
     get_table_field_names,
@@ -64,19 +65,57 @@ class SearchAirtableInput(BaseModel):
     )
 
 
-def _make_formula_case_insensitive(formula: str) -> str:
+def _make_formula_case_insensitive(formula: str, table_name: str) -> str:
     """
-    Transform equality patterns {Field} = 'value' into LOWER({Field}) = LOWER('value')
-    so that client name and similar filters are case-insensitive.
+    Transform equality patterns for link/lookup fields to use FIND (works with these types).
+    - {Field} = 'value' or LOWER({Field}) = LOWER('value') → FIND(LOWER('value'), LOWER(ARRAYJOIN({Field})))
+    - For non-link fields: keep LOWER equality.
     """
-    def _repl(m: re.Match) -> str:
+    link_lookup = get_link_and_lookup_field_names(table_name)
+
+    def _repl_eq(m: re.Match) -> str:
         field_ref = m.group(1)
         quoted_val = m.group(2)
+        field_name = field_ref.strip("{}")
+        if field_name in link_lookup:
+            return f"FIND(LOWER({quoted_val}), LOWER(ARRAYJOIN({field_ref})))"
         return f"LOWER({field_ref}) = LOWER({quoted_val})"
 
-    # Match {Field} = 'value' or {Field} = "value" (supports spaces around =)
-    pattern = r"(\{[^}]+\})\s*=\s*('(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")"
-    return re.sub(pattern, _repl, formula)
+    def _repl_lower_eq(m: re.Match) -> str:
+        field_ref = m.group(1)
+        quoted_val = m.group(2)
+        field_name = field_ref.strip("{}")
+        if field_name in link_lookup:
+            return f"FIND(LOWER({quoted_val}), LOWER(ARRAYJOIN({field_ref})))"
+        return m.group(0)
+
+    def _repl_find(m: re.Match) -> str:
+        quoted_val = m.group(1)
+        field_ref = m.group(2)
+        field_name = field_ref.strip("{}")
+        if field_name in link_lookup:
+            return f"FIND(LOWER({quoted_val}), LOWER(ARRAYJOIN({field_ref})))"
+        return m.group(0)
+
+    # Pattern 1: {Field} = 'value'
+    formula = re.sub(
+        r"(\{[^}]+\})\s*=\s*('(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")",
+        _repl_eq,
+        formula,
+    )
+    # Pattern 2: LOWER({Field}) = LOWER('value') — agent sometimes generates this
+    formula = re.sub(
+        r"LOWER\((\{[^}]+\})\)\s*=\s*LOWER\(('(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")\)",
+        _repl_lower_eq,
+        formula,
+    )
+    # Pattern 3: FIND('value', {Field}) — rendre insensible à la casse pour lien/lookup
+    formula = re.sub(
+        r"FIND\(('(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"),\s*(\{[^}]+\})\)",
+        _repl_find,
+        formula,
+    )
+    return formula
 
 
 def _is_list_all_intent(query: str) -> bool:
@@ -250,7 +289,7 @@ def _search_airtable_impl(
 
     # Custom formula: use it directly (overrides query)
     if formula and formula.strip():
-        formula = _make_formula_case_insensitive(formula.strip())
+        formula = _make_formula_case_insensitive(formula.strip(), table_name)
         print(f"[AIRTABLE] Querying table '{table_name}' with custom formula:")
         print(f"[AIRTABLE]   formula = {formula!r}")
         try:

@@ -334,6 +334,26 @@ def _resolve_field_name_in_table(
     return None
 
 
+def get_link_and_lookup_field_names(table_name: str) -> set[str]:
+    """
+    Return the set of field names that are multipleRecordLinks or multipleLookupValues.
+    Used to apply FIND() instead of = when filtering by these fields (FIND works for link/lookup).
+    """
+    raw = _fetch_raw_base_schema(AIRTABLE_BASE_ID, AIRTABLE_API_KEY)
+    if not raw:
+        return set()
+    for tbl in raw.get("tables") or []:
+        if tbl.get("name") != table_name:
+            continue
+        result: set[str] = set()
+        for f in tbl.get("fields") or []:
+            if f.get("type") in ("multipleRecordLinks", "multipleLookupValues"):
+                if f.get("name"):
+                    result.add(f["name"])
+        return result
+    return set()
+
+
 def _get_relations_schema_fallback() -> str:
     """Fallback when raw schema unavailable: use get_link_fields_config (pyairtable)."""
     table_names = fetch_all_tables_metadata(AIRTABLE_BASE_ID, AIRTABLE_API_KEY)
