@@ -2,21 +2,28 @@
 Chat API: streaming endpoint and human-in-the-loop resume.
 """
 import asyncio
+import logging
 import uuid
 from typing import Annotated, Any, AsyncGenerator
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi.responses import Response, StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.tracers.stdout import ConsoleCallbackHandler
 from langgraph.types import Command
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.graph import get_graph
 from app.api.deps import User, get_current_user
 from app.core.database import get_db
 from app.models import Thread
+from app.services.titling import generate_chat_title
+
+LOG = logging.getLogger(__name__)
+FIRST_CHAT = "[FIRST-CHAT]"
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -76,33 +83,62 @@ def _to_langchain_messages(messages: list[ChatMessage]) -> list:
     return out
 
 
+# Placeholder title for client-created threads until auto-titling runs
+NEW_CHAT_TITLE = "New Chat"
+
+
 async def _ensure_thread(
     db: AsyncSession,
     user: User,
     thread_id: str | None,
 ) -> uuid.UUID:
     """
-    If thread_id is provided, verify it belongs to user (else 403).
-    If not provided or new, insert a new thread and return its id.
+    If thread_id is provided: verify it belongs to user, or create it (client-side ID).
+    If not provided, insert a new thread with server-generated id and return it.
     """
     user_uuid = uuid.UUID(user.id)
 
     if thread_id:
-        result = await db.execute(
-            select(Thread).where(
-                Thread.thread_id == uuid.UUID(thread_id),
-                Thread.user_id == user_uuid,
-            )
-        )
+        try:
+            thread_uuid = uuid.UUID(thread_id)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid thread_id format",
+            ) from None
+        result = await db.execute(select(Thread).where(Thread.thread_id == thread_uuid))
         thread = result.scalar_one_or_none()
-        if not thread:
+        if thread:
+            if thread.user_id != user_uuid:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Thread not found or access denied",
+                )
+            return thread.thread_id
+        # Client-provided ID but not in DB: create thread (or race: POST /api/chat just created it)
+        thread = Thread(
+            thread_id=thread_uuid,
+            user_id=user_uuid,
+            title=NEW_CHAT_TITLE,
+            metadata_={},
+        )
+        db.add(thread)
+        try:
+            await db.commit()
+            await db.refresh(thread)
+            return thread.thread_id
+        except IntegrityError:
+            await db.rollback()
+            result = await db.execute(select(Thread).where(Thread.thread_id == thread_uuid))
+            thread = result.scalar_one_or_none()
+            if thread and thread.user_id == user_uuid:
+                return thread.thread_id
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Thread not found or access denied",
             )
-        return thread.thread_id
 
-    # New thread: insert
+    # No thread_id: new thread with server-generated id
     thread = Thread(
         user_id=user_uuid,
         title=None,
@@ -133,6 +169,9 @@ async def _event_stream(
     """
     graph = await get_graph()
 
+    thread_id = config.get("configurable", {}).get("thread_id", "")
+    LOG.info("%s stream START thread_id=%s", "[FLOW]", thread_id)
+    chunk_count = 0
     try:
         async for event in graph.astream_events(
             input_state,
@@ -145,7 +184,9 @@ async def _event_stream(
                 content = event["data"]["chunk"].content
                 content = _chunk_content_to_str(content)
                 if content:
+                    chunk_count += 1
                     yield content.encode("utf-8")
+        LOG.info("%s stream END chunk_count=%s", "[FLOW]", chunk_count)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -158,6 +199,7 @@ async def _event_stream(
 @router.post("")
 async def chat_stream(
     body: ChatRequest,
+    background_tasks: BackgroundTasks,
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
@@ -166,8 +208,24 @@ async def chat_stream(
     Uses Vercel AI SDK–compatible SSE (x-vercel-ai-ui-message-stream: v1).
     On HITL interrupt, sends a data-hitl-pause part so the frontend can show Approve/Reject.
     """
+    LOG.info("%s demande reçue thread_id=%s messages=%s", "[FLOW]", body.thread_id, len(body.messages or []))
     thread_uuid = await _ensure_thread(db, current_user, body.thread_id)
     config = {"configurable": {"thread_id": str(thread_uuid)}}
+
+    # Auto-titling: first message or thread still has no title
+    current_title = None
+    if body.thread_id:
+        r = await db.execute(select(Thread.title).where(Thread.thread_id == thread_uuid))
+        row = r.one_or_none()
+        current_title = row[0] if row else None
+    should_title = (
+        body.thread_id is None
+        or current_title is None
+        or (current_title or "").strip() == "New Chat"
+    )
+    first_message_content = (body.messages[-1].content or "").strip() if body.messages else ""
+    if should_title and first_message_content:
+        background_tasks.add_task(generate_chat_title, first_message_content, str(thread_uuid))
 
     lc_messages = _to_langchain_messages(body.messages)
     if not lc_messages:
@@ -196,6 +254,40 @@ async def chat_stream(
     )
 
 
+class ThreadListItem(BaseModel):
+    """One thread in the list for GET /threads."""
+
+    thread_id: str
+    title: str | None
+    created_at: str
+
+
+@router.get("/threads", response_model=list[ThreadListItem])
+async def list_threads(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """
+    Return the list of threads for the current user (for sidebar).
+    Ordered by created_at descending.
+    """
+    user_uuid = uuid.UUID(current_user.id)
+    result = await db.execute(
+        select(Thread)
+        .where(Thread.user_id == user_uuid)
+        .order_by(Thread.created_at.desc())
+    )
+    threads = result.scalars().all()
+    return [
+        ThreadListItem(
+            thread_id=str(t.thread_id),
+            title=t.title,
+            created_at=t.created_at.isoformat() if t.created_at else "",
+        )
+        for t in threads
+    ]
+
+
 @router.get("/history")
 async def chat_history(
     thread_id: str,
@@ -205,20 +297,23 @@ async def chat_history(
     """
     Return message history for a thread (user + assistant only).
     Used by the frontend to restore conversation on reload or when switching threads.
+    For new threads (no checkpoint yet), returns empty messages instead of 404/500.
     """
+    LOG.info("%s GET /history IN thread_id=%s", FIRST_CHAT, thread_id)
     thread_uuid = await _ensure_thread(db, current_user, thread_id)
     config = {"configurable": {"thread_id": str(thread_uuid)}}
-    graph = await get_graph()
     try:
+        graph = await get_graph()
         state = await graph.aget_state(config)
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Thread state not found: {e!s}",
-        ) from e
+        LOG.info("%s GET /history no state (new thread?) → [] %s", FIRST_CHAT, type(e).__name__)
+        return {"messages": []}
     if not state or not state.values:
+        LOG.info("%s GET /history state empty → []", FIRST_CHAT)
         return {"messages": []}
     messages = state.values.get("messages") or []
+    count = len(messages)
+    LOG.info("%s GET /history OUT messages_count=%s", FIRST_CHAT, count)
     return {"messages": _state_messages_to_api(messages)}
 
 
@@ -238,6 +333,7 @@ async def chat_resume(
             detail="action must be 'approve' or 'reject'",
         )
 
+    LOG.info("%s POST /resume IN thread_id=%s action=%s", "[FLOW]", body.thread_id, body.action)
     thread_uuid = await _ensure_thread(db, current_user, body.thread_id)
     config = {"configurable": {"thread_id": str(thread_uuid)}}
 
@@ -248,14 +344,49 @@ async def chat_resume(
             config=config,
         )
     except Exception as e:
+        LOG.warning("%s POST /resume FAILED thread_id=%s error=%s", "[FLOW]", body.thread_id, e)
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Resume failed: {e!s}",
         ) from e
 
+    msg_count = len(result.get("messages", []))
+    LOG.info("%s POST /resume OUT thread_id=%s action=%s messages_count=%s", "[FLOW]", str(thread_uuid), body.action, msg_count)
     return {
         "status": "resumed",
         "thread_id": str(thread_uuid),
         "action": body.action,
-        "messages_count": len(result.get("messages", [])),
+        "messages_count": msg_count,
     }
+
+
+@router.delete("/threads/{thread_id}")
+async def delete_thread(
+    thread_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """
+    Delete a conversation thread. Only the owner can delete (403 otherwise).
+    Returns 204 No Content on success.
+    """
+    user_uuid = uuid.UUID(current_user.id)
+    try:
+        thread_uuid = uuid.UUID(thread_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid thread_id") from None
+    result = await db.execute(
+        select(Thread).where(
+            Thread.thread_id == thread_uuid,
+            Thread.user_id == user_uuid,
+        )
+    )
+    thread = result.scalar_one_or_none()
+    if not thread:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Thread not found or access denied",
+        )
+    await db.execute(delete(Thread).where(Thread.thread_id == thread_uuid))
+    await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

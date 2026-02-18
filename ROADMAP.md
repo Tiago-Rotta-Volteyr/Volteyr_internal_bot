@@ -40,6 +40,7 @@ This document tracks the progress of the project. Cursor must update this file a
     - [x] Implement "Schema Injection" (The LLM must know the table structure) — multi-table meta-schema via `get_table_schema()`.
     - [x] Implement strict Pydantic models for the tool input (`SearchAirtableInput`, `table_name` validated against `AIRTABLE_TABLE_NAMES`).
     - [x] Bind tool to Main Agent and test retrieval (Main Agent must synthesize the JSON result). Config: `AIRTABLE_TABLE_NAMES` (comma-separated); tests in `backend/test_airtable.py`.
+    - [x] **Airtable Self-Correction (Sub-Graph)** : Tool never raises (returns `Error: ...` string); Airtable sub-agent in `agent/subgraphs/airtable.py` with max 3 retries on column/API errors; main graph delegates via node `delegate_to_airtable`; debug prints `[AIRTABLE] Querying/Success/Error` in tool.
 - [x] **Skill 2: RAG (Knowledge Base)**
     - [x] Setup Vector Store connection (PGVector via langchain-postgres, pgvector extension).
     - [x] Create `tools/retrieval.py` (`lookup_policy` tool), `scripts/ingest_docs.py`, `knowledge_base/`, migration `001_pgvector_extension.sql`. Tests: `test_rag.py`.

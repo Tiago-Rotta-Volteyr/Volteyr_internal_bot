@@ -1,11 +1,14 @@
 """
 LangGraph brain: StateGraph, agent node, and persistent checkpointer.
 """
+import asyncio
+import json
+import logging
 import os
 from typing import Any
 
 from dotenv import load_dotenv
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 from psycopg.rows import dict_row
@@ -13,12 +16,63 @@ from psycopg_pool import AsyncConnectionPool
 
 from app.agent.prompts import build_system_prompt
 from app.agent.state import AgentState
+from app.agent.subgraphs.airtable import get_airtable_graph
 from app.tools.airtable import search_airtable
 from app.tools.email import send_email
 from app.tools.retrieval import lookup_policy
 from app.tools.utils import get_table_schema
 
 load_dotenv()
+
+FLOW = "[FLOW]"
+LOG = logging.getLogger(__name__)
+
+# Message when a previous turn had tool_calls but no tool response (interrupt/crash)
+_TOOL_INTERRUPTED_PLACEHOLDER = (
+    "Error: the previous action was interrupted. Please try again or rephrase your request."
+)
+
+
+def _sanitize_messages_for_llm(messages: list) -> list:
+    """
+    Ensure every AIMessage with tool_calls has corresponding ToolMessages.
+    If the checkpoint has an assistant message with tool_calls but no (or incomplete) tool
+    responses (e.g. after HITL interrupt or crash), inject placeholder ToolMessages so
+    the OpenAI API does not return 400.
+    """
+    result: list[Any] = []
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        result.append(msg)
+        if hasattr(msg, "tool_calls") and msg.tool_calls:
+            ids_expected = {tc.get("id") for tc in msg.tool_calls if tc.get("id")}
+            ids_seen: set[str] = set()
+            j = i + 1
+            while j < len(messages):
+                next_msg = messages[j]
+                if isinstance(next_msg, ToolMessage):
+                    tid = getattr(next_msg, "tool_call_id", None)
+                    if tid in ids_expected:
+                        ids_seen.add(tid or "")
+                    result.append(next_msg)
+                    j += 1
+                else:
+                    break
+            missing = {x for x in (ids_expected - ids_seen) if x}
+            for tid in missing:
+                result.append(
+                    ToolMessage(
+                        content=_TOOL_INTERRUPTED_PLACEHOLDER,
+                        tool_call_id=tid,
+                    )
+                )
+            if missing:
+                LOG.warning("%s sanitize: injected %s placeholder ToolMessage(s) for missing tool_call_ids", FLOW, len(missing))
+            i = j
+            continue
+        i += 1
+    return result
 
 # Checkpointer lifecycle: pool and saver kept in module scope so the compiled graph stays valid.
 _pool: AsyncConnectionPool | None = None
@@ -53,21 +107,88 @@ def _build_graph() -> StateGraph:
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0).bind_tools([search_airtable, lookup_policy, send_email])
 
     async def call_model(state: AgentState) -> dict[str, Any]:
-        messages = [SystemMessage(content=system_prompt)] + state["messages"]
+        nm = len(state["messages"])
+        last_msg = state["messages"][-1] if state["messages"] else None
+        last_preview = ""
+        if last_msg and getattr(last_msg, "content", None):
+            last_preview = (str(last_msg.content)[:200] + "…") if len(str(last_msg.content)) > 200 else str(last_msg.content)
+        LOG.info("%s agent IN messages_count=%s last_preview=%s", FLOW, nm, last_preview[:100] if last_preview else "")
+        messages = [SystemMessage(content=system_prompt)] + _sanitize_messages_for_llm(state["messages"])
         response = await llm.ainvoke(messages)
+        tool_calls = getattr(response, "tool_calls", None) or []
+        content_preview = (getattr(response, "content", None) or "")[:150] if getattr(response, "content", None) else ""
+        if tool_calls:
+            names = [tc.get("name") for tc in tool_calls if tc.get("name")]
+            LOG.info("%s agent OUT tool_calls=%s", FLOW, names)
+        else:
+            LOG.info("%s agent OUT end (no tool_calls) content_preview=%s", FLOW, content_preview[:80] if content_preview else "")
         return {"messages": [response]}
 
     def _run_tool(name: str, args: dict) -> str:
         try:
-            if name == "search_airtable":
-                return search_airtable.invoke(args)
             if name == "lookup_policy":
                 return lookup_policy.invoke(args)
             if name == "send_email":
                 return send_email.invoke(args)
+            if name == "search_airtable":
+                return _run_airtable_subgraph_sync(args)
             return f"Unknown tool: {name}"
         except Exception as e:
             return f"Error running {name}: {e!s}"
+
+    def _run_airtable_subgraph_sync(args: dict) -> str:
+        """Run Airtable subgraph (sync) and return final result string. Never raise."""
+        try:
+            table = args.get("table_name", "?")
+            query = (args.get("query") or "").strip() or "(liste)"
+            LOG.info("%s outil Airtable: appel recherche table=%s query=%s sort_by=%s sort_direction=%s max_records=%s", FLOW, table, query, args.get("sort_by"), args.get("sort_direction"), args.get("max_records"))
+            airtable_graph = get_airtable_graph()
+            query_desc = json.dumps(args, ensure_ascii=False) if args else "Query Airtable"
+            initial_state: dict[str, Any] = {
+                "messages": [HumanMessage(content=query_desc)],
+                "retries_used": 0,
+            }
+            result = airtable_graph.invoke(initial_state)
+            messages = result.get("messages") or []
+            if not messages:
+                LOG.info("%s outil Airtable: réponse → aucun enregistrement", FLOW)
+                return "No records found."
+            last = messages[-1]
+            content = getattr(last, "content", None)
+            out = content if isinstance(content, str) else str(content) if content is not None else ""
+            out = out if out else "No records found."
+            if "Error" in out or "error" in out.lower():
+                LOG.info("%s outil Airtable: réponse → erreur", FLOW)
+            elif "No records" in out or not out.strip():
+                LOG.info("%s outil Airtable: réponse → aucun enregistrement", FLOW)
+            else:
+                lines = out.count("\n") + 1
+                LOG.info("%s outil Airtable: réponse → %s (résultat reçu)", FLOW, f"{lines} lignes" if lines > 1 else "1 ligne")
+            return out
+        except Exception as e:
+            LOG.warning("%s outil Airtable: erreur %s", FLOW, e)
+            return f"Error executing tool: {e!s}"
+
+    async def delegate_to_airtable(state: AgentState) -> dict[str, Any]:
+        """Run Airtable subgraph for each search_airtable tool call; return ToolMessages for the main agent."""
+        last = state["messages"][-1]
+        tool_messages = []
+        if hasattr(last, "tool_calls") and last.tool_calls:
+            LOG.info("%s appel outil Airtable (sous-graphe)", FLOW)
+            for tc in last.tool_calls:
+                name = tc.get("name")
+                if name != "search_airtable":
+                    continue
+                args = tc.get("args") or {}
+                tool_call_id = tc.get("id", "")
+                try:
+                    out = await asyncio.to_thread(_run_airtable_subgraph_sync, args)
+                    content = str(out) if out is not None else "No records found."
+                except Exception as e:
+                    content = f"Error executing tool: {e!s}"
+                tool_messages.append(ToolMessage(content=content, tool_call_id=tool_call_id))
+            LOG.info("%s Airtable → résultat reçu (%s réponse(s))", FLOW, len(tool_messages))
+        return {"messages": tool_messages}
 
     async def run_tools(state: AgentState) -> dict[str, Any]:
         from langchain_core.messages import ToolMessage
@@ -75,13 +196,22 @@ def _build_graph() -> StateGraph:
         last = state["messages"][-1]
         tool_messages = []
         if hasattr(last, "tool_calls") and last.tool_calls:
+            names = [tc.get("name") for tc in last.tool_calls if tc.get("name")]
+            LOG.info("%s appel outils: %s", FLOW, names)
             for tc in last.tool_calls:
                 name = tc.get("name")
                 args = tc.get("args") or {}
-                out = _run_tool(name or "", args)
-                tool_messages.append(
-                    ToolMessage(content=str(out), tool_call_id=tc.get("id", ""))
-                )
+                tool_call_id = tc.get("id", "")
+                try:
+                    if name == "search_airtable":
+                        out = await asyncio.to_thread(_run_airtable_subgraph_sync, args)
+                    else:
+                        out = _run_tool(name or "", args)
+                    content = str(out) if out is not None else "Error executing tool: no output."
+                except Exception as e:
+                    content = f"Error executing tool: {e!s}"
+                tool_messages.append(ToolMessage(content=content, tool_call_id=tool_call_id))
+            LOG.info("%s outils → réponses reçues (%s)", FLOW, len(tool_messages))
         return {"messages": tool_messages}
 
     async def run_tools_email(state: AgentState) -> dict[str, Any]:
@@ -91,16 +221,21 @@ def _build_graph() -> StateGraph:
         last = state["messages"][-1]
         tool_messages = []
         if hasattr(last, "tool_calls") and last.tool_calls:
+            LOG.info("%s appel outil email (HITL approuvé)", FLOW)
             for tc in last.tool_calls:
                 name = tc.get("name")
                 args = tc.get("args") or {}
-                if name == "send_email":
-                    out = _run_tool(name, args)
-                else:
-                    out = f"Skipped (not email): {name}"
-                tool_messages.append(
-                    ToolMessage(content=str(out), tool_call_id=tc.get("id", ""))
-                )
+                tool_call_id = tc.get("id", "")
+                try:
+                    if name == "send_email":
+                        out = _run_tool(name, args)
+                    else:
+                        out = f"Skipped (not email): {name}"
+                    content = str(out) if out is not None else "Error executing tool: no output."
+                except Exception as e:
+                    content = f"Error executing tool: {e!s}"
+                tool_messages.append(ToolMessage(content=content, tool_call_id=tool_call_id))
+            LOG.info("%s email → envoyé", FLOW)
         return {"messages": tool_messages}
 
     # Rate limit: max tool invocations per turn to avoid infinite retry loops
@@ -118,18 +253,24 @@ def _build_graph() -> StateGraph:
         names = [tc.get("name") for tc in last.tool_calls if tc.get("name")]
         if "send_email" in names:
             return "tools_email"
+        if names and all(n == "search_airtable" for n in names):
+            return "airtable"
         return "tools"
 
     graph = StateGraph(AgentState)
     graph.add_node("agent", call_model)
     graph.add_node("tools", run_tools)
     graph.add_node("tools_email", run_tools_email)
+    graph.add_node("delegate_to_airtable", delegate_to_airtable)
     graph.add_edge(START, "agent")
     graph.add_conditional_edges(
-        "agent", should_continue, {"tools": "tools", "tools_email": "tools_email", "end": END}
+        "agent",
+        should_continue,
+        {"tools": "tools", "tools_email": "tools_email", "airtable": "delegate_to_airtable", "end": END},
     )
     graph.add_edge("tools", "agent")
     graph.add_edge("tools_email", "agent")
+    graph.add_edge("delegate_to_airtable", "agent")
     return graph
 
 

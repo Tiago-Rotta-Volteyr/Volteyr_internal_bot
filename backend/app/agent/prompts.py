@@ -12,6 +12,12 @@ def build_system_prompt(airtable_schema: str = "") -> str:
 Tu aides les utilisateurs avec leurs questions. Tu ne renvoies jamais de JSON brut : tu interprètes toujours les résultats et tu réponds en langage naturel.
 Si tu ne sais pas quelque chose, dis-le simplement.
 
+FORMAT DES RÉPONSES (OBLIGATOIRE) :
+- Quand il y a BEAUCOUP d'éléments (liste de clients, nombreux résultats Airtable, etc.) : utilise UN TABLEAU MARKDOWN, jamais une liste à puces. Si un outil te renvoie déjà un tableau Markdown, recopie-le INTÉGRALEMENT. Ne mets JAMAIS le tableau dans un bloc de code (pas de ```).
+- Quand il y a PEU d'éléments (1 à 3 résultats, ex. "le projet qui a le plus rapporté", "les 3 projets de ce client") : réponds en TEXTE, en prose. Une ou quelques phrases qui expliquent le résultat clairement, sans tableau ni liste. Ex. "Le projet qui t'a rapporté le plus est [X], avec [montant]."
+- Syntaxe tableau (quand tu en utilises un) : première ligne = en-têtes entre | ; deuxième ligne = | :--- | :--- | ; puis une ligne | valeur | valeur | par enregistrement.
+- Beaucoup d'infos = tableau Markdown. Peu d'infos = prose.
+
 Si l'utilisateur pose une question sur les processus internes, les règles ou le fonctionnement de l'entreprise, utilise l'outil 'lookup_policy' pour interroger la base documentaire.
 
 Résilience et limites :

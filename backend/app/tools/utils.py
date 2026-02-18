@@ -1,12 +1,14 @@
 """
-Helpers for tools: schema inspection (multi-table), primary field resolution.
+Helpers for tools: schema inspection (multi-table), primary field resolution,
+link field config for resolving linked record IDs to display names.
 """
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from app.core.config import (
     AIRTABLE_BASE_ID,
     AIRTABLE_API_KEY,
     AIRTABLE_TABLE_NAMES,
+    AIRTABLE_LINK_DISPLAY_FIELDS,
 )
 
 
@@ -94,3 +96,49 @@ def get_primary_field_name(table_name: str) -> Optional[str]:
         return None
     except Exception:
         return None
+
+
+def get_link_fields_config(table_name: str) -> List[dict[str, Any]]:
+    """
+    Return config for link fields in the given table: for each field of type
+    multipleRecordLinks, return {field_name, linked_table_name, display_field}.
+    display_field is the field to show from the linked record (from
+    AIRTABLE_LINK_DISPLAY_FIELDS or primary field of linked table).
+    """
+    if not AIRTABLE_API_KEY or not AIRTABLE_BASE_ID:
+        return []
+    try:
+        from pyairtable import Api
+
+        api = Api(AIRTABLE_API_KEY)
+        base = api.base(AIRTABLE_BASE_ID)
+        schema = base.schema()
+        # Build table_id -> table name (schema.tables = list of TableSchema with id, name)
+        table_id_to_name: dict[str, str] = {}
+        for t in schema.tables:
+            table_id_to_name[t.id] = t.name
+        table_schema = schema.table(table_name)
+        result: List[dict[str, Any]] = []
+        for f in table_schema.fields:
+            if getattr(f, "type", None) != "multipleRecordLinks":
+                continue
+            options = getattr(f, "options", None)
+            linked_table_id = getattr(options, "linked_table_id", None) if options else None
+            if not linked_table_id:
+                continue
+            linked_table_name = table_id_to_name.get(linked_table_id)
+            if not linked_table_name:
+                continue
+            display_field = (
+                AIRTABLE_LINK_DISPLAY_FIELDS.get(linked_table_name)
+                or get_primary_field_name(linked_table_name)
+                or "Name"
+            )
+            result.append({
+                "field_name": f.name,
+                "linked_table_name": linked_table_name,
+                "display_field": display_field,
+            })
+        return result
+    except Exception:
+        return []

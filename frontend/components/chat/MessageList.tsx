@@ -1,6 +1,7 @@
 "use client";
 
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { cn } from "@/lib/utils";
 
@@ -60,8 +61,12 @@ export function MessageList({ messages, isLoading }: MessageListProps) {
             )}
           >
             {msg.role === "assistant" ? (
-              <div className="prose prose-invert prose-sm max-w-none break-words">
-                <ReactMarkdown>{stripHitlMarker(getMessageContent(msg))}</ReactMarkdown>
+              <div className="prose prose-invert prose-sm max-w-none break-words [&_table]:w-full [&_table]:border-collapse [&_th]:border [&_th]:border-zinc-600 [&_th]:bg-zinc-700/80 [&_th]:px-3 [&_th]:py-2 [&_th]:text-left [&_td]:border [&_td]:border-zinc-600 [&_td]:px-3 [&_td]:py-2 [&_table]:rounded [&_th]:first-of-type:rounded-tl [&_th]:last-of-type:rounded-tr [&_tr]:last-of-type_[&_td]:first-of-type:rounded-bl [&_tr]:last-of-type_[&_td]:last-of-type:rounded-br">
+                <div className="overflow-x-auto">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                    {stripHitlMarker(getMessageContent(msg))}
+                  </ReactMarkdown>
+                </div>
               </div>
             ) : (
               <span className="whitespace-pre-wrap">{getMessageContent(msg)}</span>
