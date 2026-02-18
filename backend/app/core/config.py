@@ -43,6 +43,27 @@ def _parse_link_display_fields(value: str | None) -> dict[str, str]:
     return out
 
 
+def _parse_link_field_display(value: str | None) -> dict[str, str]:
+    """
+    Parse AIRTABLE_LINK_FIELD_DISPLAY (e.g. "Projet.Client:Nom,Projet.Entreprise:Entreprise")
+    into { "Projet.Client": "Nom", "Projet.Entreprise": "Entreprise" }.
+    Used when a table has multiple link fields to the same table, each displaying a different
+    column (e.g. Client=person names, Entreprise=company names).
+    """
+    if not value or not value.strip():
+        return {}
+    out: dict[str, str] = {}
+    for part in value.split(","):
+        part = part.strip()
+        if ":" in part:
+            key, display_field = part.rsplit(":", 1)
+            out[key.strip()] = display_field.strip()
+    return out
+
+
 AIRTABLE_LINK_DISPLAY_FIELDS: dict[str, str] = _parse_link_display_fields(
     os.getenv("AIRTABLE_LINK_DISPLAY_FIELDS", "")
+)
+AIRTABLE_LINK_FIELD_DISPLAY: dict[str, str] = _parse_link_field_display(
+    os.getenv("AIRTABLE_LINK_FIELD_DISPLAY", "")
 )

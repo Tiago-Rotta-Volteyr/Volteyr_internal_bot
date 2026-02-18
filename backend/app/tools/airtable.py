@@ -3,6 +3,7 @@ Airtable tool: list, search, or query records with optional sort (e.g. "who paid
 Never raises: always returns a string (Error: ... or result) so the LLM can self-correct.
 """
 
+import re
 from typing import Literal, Optional
 
 from langchain_core.tools import tool
@@ -38,11 +39,16 @@ def _normalize_table_name(value: str) -> str | None:
 class SearchAirtableInput(BaseModel):
     """Input for search_airtable tool. Use the DATABASE SCHEMA to choose table_name and sort_by field names."""
 
-    query: str = Field(
-        description="Search term, or leave empty to list records (optionally sorted). For 'who paid the most' use empty query + sort_by=amount field (e.g. CTV) + sort_direction='desc'."
+    query: Optional[str] = Field(
+        default="",
+        description="Search term, or leave empty to list records (optionally sorted). For 'who paid the most' use empty query + sort_by=amount field (e.g. CTV) + sort_direction='desc'. Ignored if formula is provided."
     )
     table_name: str = Field(
-        description=f"Target table. Must be one of: {', '.join(_get_valid_table_names()) or 'none configured'}"
+        description="Target table. Use one of the exact names from TABLES DISPONIBLES in your context (or from the schema)."
+    )
+    formula: Optional[str] = Field(
+        default=None,
+        description="A valid Airtable formula (e.g. {Email} = 'bob@mail.com', {Status} = 'Active'). If provided, this overrides the query search. Use exact column names from the schema."
     )
     sort_by: Optional[str] = Field(
         default=None,
@@ -56,6 +62,21 @@ class SearchAirtableInput(BaseModel):
         default=None,
         description="Max number of records to return. For 'the one who paid the most' use 1; for top 5 use 5. Default 100 when listing, 10 when searching."
     )
+
+
+def _make_formula_case_insensitive(formula: str) -> str:
+    """
+    Transform equality patterns {Field} = 'value' into LOWER({Field}) = LOWER('value')
+    so that client name and similar filters are case-insensitive.
+    """
+    def _repl(m: re.Match) -> str:
+        field_ref = m.group(1)
+        quoted_val = m.group(2)
+        return f"LOWER({field_ref}) = LOWER({quoted_val})"
+
+    # Match {Field} = 'value' or {Field} = "value" (supports spaces around =)
+    pattern = r"(\{[^}]+\})\s*=\s*('(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")"
+    return re.sub(pattern, _repl, formula)
 
 
 def _is_list_all_intent(query: str) -> bool:
@@ -192,12 +213,14 @@ def _records_to_markdown_table(rows: list[dict], max_columns: int = 8) -> str:
 def _search_airtable_impl(
     query: str,
     table_name: str,
+    formula: Optional[str] = None,
     sort_by: Optional[str] = None,
     sort_direction: Optional[Literal["asc", "desc"]] = None,
     max_records: Optional[int] = None,
 ) -> str:
     """
     Inner implementation: never raises, always returns a string (Error: ... or result).
+    If formula is provided, it is used directly; otherwise query (and list-all) logic applies.
     """
     if not AIRTABLE_API_KEY or not AIRTABLE_BASE_ID:
         msg = "Error: Airtable is not configured (missing AIRTABLE_API_KEY or AIRTABLE_BASE_ID)."
@@ -225,8 +248,33 @@ def _search_airtable_impl(
     sort_param = _build_sort_param(sort_by, sort_direction or "asc")
     limit = max_records if max_records is not None and max_records > 0 else None
 
+    # Custom formula: use it directly (overrides query)
+    if formula and formula.strip():
+        formula = _make_formula_case_insensitive(formula.strip())
+        print(f"[AIRTABLE] Querying table '{table_name}' with custom formula:")
+        print(f"[AIRTABLE]   formula = {formula!r}")
+        try:
+            kwargs = {"formula": formula, "max_records": limit or 100}
+            if sort_param:
+                kwargs["sort"] = sort_param
+            records = table.all(**kwargs)
+            if not records:
+                out = f"No records matching the formula in table '{table_name}'."
+                print(f"[AIRTABLE] Success: 0 records found.")
+                return out
+            _resolve_link_fields(api, AIRTABLE_BASE_ID, table_name, records)
+            out = _records_to_markdown_table([r.get("fields", {}) for r in records])
+            print(f"[AIRTABLE] Success: {len(records)} records found.")
+            return out
+        except Exception as e:
+            fields_hint = get_table_field_names(table_name)
+            hint = f" Available fields for table '{table_name}': {fields_hint}." if fields_hint else ""
+            msg = f"Error running formula: {e}.{hint}"
+            print(f"[AIRTABLE] Error: {msg}")
+            return msg
+
     # List (with optional sort): empty query → get records, optionally sorted
-    if _is_list_all_intent(query):
+    if _is_list_all_intent(query or ""):
         formula_desc = f"list (sort={sort_param})" if sort_param else "list all"
         print(f"[AIRTABLE] Querying table '{table_name}': {formula_desc}")
         try:
@@ -312,23 +360,26 @@ def _search_airtable_impl(
 
 @tool(args_schema=SearchAirtableInput)
 def search_airtable(
-    query: str,
     table_name: str,
+    query: Optional[str] = "",
+    formula: Optional[str] = None,
     sort_by: Optional[str] = None,
     sort_direction: Optional[Literal["asc", "desc"]] = None,
     max_records: Optional[int] = None,
 ) -> str:
     """
-    Query Airtable: list records, search by text, or get top/bottom by a field (sort).
+    Query Airtable: list records, search by text, or filter by formula.
     Use the DATABASE SCHEMA to pick the right table and field names.
-    - List all: query='', table_name='Client'.
-    - Who paid the most: query='', table_name='Client', sort_by='CTV', sort_direction='desc', max_records=1.
+    - List all: table_name='Client', query=''.
+    - Who paid the most: table_name='Client', query='', sort_by='CTV', sort_direction='desc', max_records=1.
+    - Search by email (use formula): formula="{Email} = 'bob@mail.com'", table_name='Client'.
     - Search by name: query='Dupont', table_name='Client'.
     """
     try:
         return _search_airtable_impl(
-            query=query,
+            query=query or "",
             table_name=table_name,
+            formula=formula,
             sort_by=sort_by,
             sort_direction=sort_direction,
             max_records=max_records,

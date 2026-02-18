@@ -14,13 +14,14 @@ from langgraph.graph import END, START, StateGraph
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
-from app.agent.prompts import build_system_prompt
+from app.agent.prompts import get_airtable_agent_prompt
 from app.agent.state import AgentState
 from app.agent.subgraphs.airtable import get_airtable_graph
+from app.core.config import AIRTABLE_BASE_ID, AIRTABLE_API_KEY, AIRTABLE_TABLE_NAMES
 from app.tools.airtable import search_airtable
 from app.tools.email import send_email
 from app.tools.retrieval import lookup_policy
-from app.tools.utils import get_table_schema
+from app.tools.utils import fetch_all_tables_metadata, get_table_schema_formatted
 
 load_dotenv()
 
@@ -101,8 +102,22 @@ def _checkpoint_conn_string() -> str:
 
 def _build_graph() -> StateGraph:
     """Build the StateGraph (no checkpointer). Used by get_graph / get_graph_with_checkpointer."""
-    meta_schema = get_table_schema()
-    system_prompt = build_system_prompt(airtable_schema=meta_schema)
+    dynamic_table_list = fetch_all_tables_metadata(AIRTABLE_BASE_ID, AIRTABLE_API_KEY)
+    if not dynamic_table_list:
+        dynamic_table_list = list(AIRTABLE_TABLE_NAMES or [])
+    table_list = (
+        ", ".join(f"'{t}'" for t in dynamic_table_list)
+        if dynamic_table_list
+        else "(aucune table configurée)"
+    )
+    client_table = next(
+        (t for t in dynamic_table_list if "client" in t.lower()),
+        dynamic_table_list[0] if dynamic_table_list else "Client",
+    )
+    schema_section = get_table_schema_formatted(client_table)
+    if not schema_section.strip():
+        schema_section = "(schéma non disponible — utilise les noms de champs indiqués dans les erreurs.)"
+    system_prompt = get_airtable_agent_prompt(schema_section=schema_section, table_list=table_list)
 
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0).bind_tools([search_airtable, lookup_policy, send_email])
 

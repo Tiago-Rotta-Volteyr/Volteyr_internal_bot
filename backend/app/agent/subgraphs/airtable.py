@@ -11,8 +11,15 @@ from langgraph.graph.message import add_messages
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
 
+from app.core.config import AIRTABLE_BASE_ID, AIRTABLE_API_KEY, AIRTABLE_TABLE_NAMES
 from app.tools.airtable import search_airtable
-from app.tools.utils import get_table_schema
+from app.tools.utils import (
+    fetch_all_tables_metadata,
+    get_relations_schema,
+    get_table_schema,
+    get_table_schema_formatted,
+)
+from app.agent.prompts import get_airtable_agent_prompt
 
 FLOW = "[FLOW]"
 LOG = logging.getLogger(__name__)
@@ -27,72 +34,44 @@ AIRTABLE_MAX_RETRIES = 3
 
 
 def _airtable_system_prompt() -> str:
-    schema = get_table_schema()
-    return f"""Tu es l'expert Airtable. Tu interprètes la demande utilisateur et appelles l'outil search_airtable avec les bons paramètres (table_name, query, sort_by, sort_direction, max_records).
+    # Tables découvertes via l'API Metadata (ou fallback AIRTABLE_TABLE_NAMES)
+    dynamic_table_list = fetch_all_tables_metadata(AIRTABLE_BASE_ID, AIRTABLE_API_KEY)
+    if not dynamic_table_list:
+        dynamic_table_list = list(AIRTABLE_TABLE_NAMES or [])
+    table_list = (
+        ", ".join(f"'{t}'" for t in dynamic_table_list)
+        if dynamic_table_list
+        else "(aucune table configurée)"
+    )
+
+    # Table "active" pour le schéma colonnes : préférer une table dont le nom contient "Client", sinon la première
+    client_table = next(
+        (t for t in dynamic_table_list if "client" in t.lower()),
+        dynamic_table_list[0] if dynamic_table_list else "Client",
+    )
+    table_schema = get_table_schema_formatted(client_table)
+    schema_section = (
+        table_schema.strip()
+        if table_schema.strip()
+        else "(schéma non disponible — utilise les noms de champs indiqués dans les erreurs.)"
+    )
+
+    relations_section = get_relations_schema()
+    base_prompt = get_airtable_agent_prompt(
+        schema_section=schema_section,
+        table_list=table_list,
+        relations_section=relations_section,
+    )
+    # Complément : schéma complet des autres tables + règle de retry
+    full_schema = get_table_schema()
+    return f"""{base_prompt}
 
 ---
 
-### INTELLIGENT COLUMN MAPPING (CRITICAL)
+**Schéma complet (toutes les tables) :**
+{full_schema}
 
-Avant de générer une formule Airtable, tu dois ANALYSER l'input de l'utilisateur :
-
-1. **Détecte le TYPE de la donnée recherchée :**
-   - Est-ce un **Email** ? (contient '@' et '.')
-   - Est-ce un **Numéro de téléphone** ? (contient des chiffres)
-   - Est-ce un **Nom d'entreprise** ?
-   - Est-ce un **Nom de personne** ?
-
-2. **Sélectionne la colonne ADAPTÉE dans le schéma :**
-   - Si Input = **Email** -> Tu DOIS chercher dans une colonne nommée `{{Email}}`, `{{Courriel}}`, `{{Email Address}}`. N'utilise JAMAIS `{{Nom}}` ou `{{Nom Complet}}` pour un email.
-   - Si Input = **Entreprise** -> Cherche dans `{{Entreprise}}`, `{{Société}}`, `{{Company}}`.
-   - Si Input = **Nom** -> Cherche dans `{{Nom}}`, `{{Nom Complet}}`.
-
-3. **Stratégie de Formule :**
-   - Pour un **Email** (Recherche exacte) : Utilise `{{Email}} = 'bob@mail.com'` (Plus fiable que SEARCH).
-   - Pour un **Nom** (Recherche partielle) : Utilise `SEARCH(LOWER('bob'), LOWER({{Nom}}))`.
-
-### EXEMPLES DE COMPORTEMENT ATTENDU :
-- User: "Qui a l'email toto@gmail.com ?"
-- Toi: Je détecte un email. Je cherche la colonne `{{Email}}`. Formule: `{{Email}} = 'toto@gmail.com'`
-
-- User: "Infos sur l'entreprise Tesla"
-- Toi: Je détecte une entreprise. Je cherche la colonne `{{Company}}`. Formule: `SEARCH('tesla', LOWER({{Company}}))`
-
----
-
-{schema}
-
-Règles d'appel outil :
-1. Utilise UNIQUEMENT les noms de tables et de champs listés dans le schéma ci-dessus.
-2. Si l'outil renvoie "Error:" (champ introuvable, field not found, etc.), lis le message d'erreur : il peut indiquer les champs disponibles. Corrige ta requête avec un champ ou une table valide puis réessaie.
-3. Pour "qui a payé le plus" / max : query vide, sort_by=champ montant (ex. CTV, Montant), sort_direction='desc', max_records=1.
-4. Pour lister tous les enregistrements : query vide.
-5. Tu as au plus {AIRTABLE_MAX_RETRIES} tentatives en cas d'erreur ; après ça, renvoie une synthèse de l'erreur à l'utilisateur.
-
----
-
-### 1. FILTRAGE INTELLIGENT (obligatoire)
-- Ne recrache JAMAIS toutes les colonnes disponibles.
-- Analyse l'intention de l'utilisateur :
-  - S'il demande "une liste de clients", "les clients", "liste des X" : affiche UNIQUEMENT Nom (ou équivalent), Statut, et éventuellement CA/Revenue. Cache les emails, téléphones et IDs sauf si explicitement demandés.
-  - S'il demande "les contacts", "coordonnées", "emails" : ALORS affiche emails et téléphones.
-- Sois minimaliste par défaut : 3 à 5 colonnes max sauf si la question exige plus.
-
-### 2. FORMAT DE RÉPONSE — TABLEAU OU TEXTE SELON LE NOMBRE DE LIGNES
-
-**Peu de résultats (1 à 3 lignes de données)** — répondre en TEXTE, pas en tableau :
-- Si l'outil renvoie un tableau avec seulement 1, 2 ou 3 lignes de données (en excluant la ligne d'en-têtes et la ligne de séparation | :--- |), ne recopie PAS le tableau.
-- Réponds en prose : une ou quelques phrases naturelles qui expliquent le résultat. Exemples :
-  - "Le projet qui t'a rapporté le plus est [Nom du projet], avec [montant/chiffre]."
-  - "Les 3 projets de ce client sont : [Nom 1], [Nom 2] et [Nom 3]. Le plus récent est [X]."
-  - "C'est [Client X] avec qui ça s'est le mieux passé (CA de [montant])."
-- **Quand la question porte sur un montant (qui a payé le plus, CA, etc.)** : le tableau renvoyé par l'outil contient une colonne avec les valeurs en euros/devise (celle que tu as utilisée pour le tri, ou tout champ de type currency/number du schéma). Tu DOIS lire la valeur de cette colonne dans la ligne résultat et l'indiquer dans ta réponse. Ne dis pas seulement "c'est le client X" — dis "c'est le client X, avec [valeur de la colonne montant]". Si le nom de la colonne n'est pas évident (ex. CTV, CA), le type dans le schéma (currency, number) t'indique quelle colonne contient le montant.
-- Sois direct, lisible et adapté à la question posée. Pas de tableau, pas de liste à puces : du texte fluide.
-
-**Beaucoup de résultats (4 lignes ou plus)** — utiliser un TABLEAU MARKDOWN :
-- Recopie le tableau INTÉGRALEMENT dans ta réponse, sans le convertir en liste. Garde la syntaxe | col1 | col2 | avec les retours à la ligne.
-- Une courte phrase d'intro (ex. "Voici les clients :") puis le tableau brut. Ne mets pas le tableau dans un bloc de code (pas de ```).
-- Si tu dois présenter toi-même plusieurs items dans ce cas, utilise un tableau Markdown avec en-têtes et | :--- |."""
+**Règle** : Tu as au plus {AIRTABLE_MAX_RETRIES} tentatives en cas d'erreur ; après ça, renvoie une synthèse de l'erreur à l'utilisateur. Si l'outil renvoie "Error:" (champ introuvable, etc.), lis le message et réessaie avec un champ ou une table valide."""
 
 
 def _build_airtable_graph() -> StateGraph:
@@ -123,7 +102,7 @@ def _build_airtable_graph() -> StateGraph:
         if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
             for tc in last_msg.tool_calls:
                 a = tc.get("args") or {}
-                LOG.info("%s Airtable (sous-graphe): query complète → table=%s query=%s sort_by=%s sort_direction=%s max_records=%s", FLOW, a.get("table_name"), a.get("query"), a.get("sort_by"), a.get("sort_direction"), a.get("max_records"))
+                LOG.info("%s Airtable (sous-graphe): query complète → table=%s query=%s formula=%s sort_by=%s sort_direction=%s max_records=%s", FLOW, a.get("table_name"), a.get("query"), a.get("formula"), a.get("sort_by"), a.get("sort_direction"), a.get("max_records"))
         else:
             LOG.info("%s Airtable (sous-graphe): outil search_airtable appelé", FLOW)
         out = tool_node.invoke(state)
